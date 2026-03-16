@@ -1,0 +1,17 @@
+{
+  "name": "bluebubbles-mcp",
+  "version": "1.0.0",
+  "description": "BlueBubbles MCP server — iMessage/SMS via Private API",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@types/node": "^22.0.0"
+  }
+}
