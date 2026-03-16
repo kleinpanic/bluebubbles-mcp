@@ -10,7 +10,7 @@
  *   bb_list_contacts      — address book contacts
  *   bb_send_message       — send iMessage/SMS
  *   bb_find_my_devices    — list iCloud Find My devices
- *   bb_find_my_location   — get device location
+ *   bb_find_my_friends    — list Find My friends
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -182,17 +182,12 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "bb_find_my_location",
-    description: "Find My - get location of a specific device by ID",
+    name: "bb_find_my_friends",
+    description: "Find My - list friends and their locations",
     inputSchema: {
       type: "object",
-      properties: {
-        device_id: {
-          type: "string",
-          description: "The device ID from bb_find_my_devices",
-        },
-      },
-      required: ["device_id"],
+      properties: {},
+      required: [],
     },
   },
 ];
@@ -325,14 +320,13 @@ async function handleSendMessage(args: Record<string, unknown>): Promise<string>
 }
 
 async function handleFindMyDevices(): Promise<string> {
-  const data = await bbGet<Record<string, unknown>>("/api/v1/findmy/devices");
+  const data = await bbGet<Record<string, unknown>>("/api/v1/icloud/findmy/devices");
   return JSON.stringify(data, null, 2);
 }
 
-async function handleFindMyLocation(args: Record<string, unknown>): Promise<string> {
-  const deviceId = String(args.deviceId ?? args.device_id);
+async function handleFindMyFriends(): Promise<string> {
   const data = await bbGet<Record<string, unknown>>(
-    `/api/v1/findmy/location/${encodeURIComponent(deviceId)}`
+    "/api/v1/icloud/findmy/friends"
   );
   return JSON.stringify(data, null, 2);
 }
@@ -369,8 +363,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "bb_find_my_devices":
         result = await handleFindMyDevices();
         break;
-      case "bb_find_my_location":
-        result = await handleFindMyLocation(args as Record<string, unknown>);
+      case "bb_find_my_friends":
+        result = await handleFindMyFriends();
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
