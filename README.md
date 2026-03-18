@@ -1,195 +1,141 @@
 # BlueBubbles MCP Server v2.0
 
-MCP server for iMessage/SMS via BlueBubbles Private API. Runs as a persistent HTTP/SSE service on collins, reachable from broklein via SSH tunnel over the wg-teleport mesh.
+A persistent HTTP/SSE MCP server exposing 20 tools over the BlueBubbles REST API. Runs as a launchd service on macOS, accessible over wg-teleport mesh.
 
 ## Architecture
 
 ```
-broklein                         collins (10.70.80.12)
-┌─────────────────────┐          ┌─────────────────────────────┐
-│ mcporter             │          │ Node MCP service             │
-│  baseUrl:            │  autossh │  (dist/index.js)             │
-│  127.0.0.1:18800/sse ├─────────►│  bound to 10.70.80.12:18791  │
-│                     │  tunnel  │                             │
-│ user systemd:        │          │ launchd:                    │
-│  openclaw-bb-mcp-    │          │  com.openclaw.bluebubbles-  │
-│  forward.service     │          │  mcp.plist (KeepAlive)      │
-└─────────────────────┘          └──────────┬──────────────────┘
-                                            │ http://127.0.0.1:1234
-                                  ┌─────────▼──────────────────┐
-                                  │ BlueBubbles Server v1.9.9  │
-                                  │ (macOS app, local only)    │
-                                  └────────────────────────────┘
+Agent (broklein)
+  mcporter (HTTP/SSE client)
+    localhost:18800  <-- autossh LocalForward
+      10.70.80.12:18791 (MCP HTTP/SSE, this process)
+        http://localhost:1234 (BlueBubbles server)
+          iMessage / SMS via macOS Messages.app
 ```
 
 ## Setup
 
-### Prerequisites
-- BlueBubbles server running on collins with Private API enabled
-- wg-teleport mesh active (collins at `10.70.80.12`, broklein at `10.70.80.10`)
-- Password at `/Users/collins/.config/bluebubbles/password`
-
-### Collins — Start the MCP service
+### Collins (macOS)
 ```bash
-# Install launchd plist (already done)
+cd ~/code/bluebubbles-mcp
+npm install && npm run build
+
+# Install launchd service
+cp LaunchAgents/com.openclaw.bluebubbles-mcp.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.openclaw.bluebubbles-mcp.plist
-
-# Check it's running
-launchctl list | grep bluebubbles-mcp
-
-# Logs
-tail -f ~/Library/Logs/bluebubbles-mcp.log
 ```
 
-### broklein — Start the SSH tunnel
+Config via environment in plist:
+- `BB_URL` — BlueBubbles server URL (default: `http://127.0.0.1:1234`)
+- `BB_PASSWORD` — path to password file or raw password
+- `MCP_BIND` — bind address (default: `10.70.80.12`)
+- `MCP_PORT` — port (default: `18791`)
+- `MCP_TRANSPORT` — `http` or `stdio` (default: `http`)
+
+### Broklein (Linux)
 ```bash
-# User systemd service (already installed + enabled)
-systemctl --user start openclaw-bb-mcp-forward.service
-systemctl --user status openclaw-bb-mcp-forward.service
+# SSH tunnel via autossh
+systemctl --user start openclaw-bb-mcp-forward
 
-# Verify tunnel
-curl http://127.0.0.1:18800/health
-```
-
-### mcporter config (`~/.mcporter/mcporter.json`)
-```json
-"bluebubbles": {
-  "description": "BlueBubbles iMessage/SMS MCP v2.0",
-  "baseUrl": "http://127.0.0.1:18800/sse"
+# mcporter config (~/.mcporter/mcporter.json)
+{
+  "servers": {
+    "bluebubbles": {
+      "type": "sse",
+      "baseUrl": "http://127.0.0.1:18800/sse"
+    }
+  }
 }
 ```
-
-## Environment Variables (launchd plist)
-
-| Variable | Value | Purpose |
-|----------|-------|---------|
-| `MCP_TRANSPORT` | `http` | HTTP/SSE mode (use `stdio` for legacy) |
-| `MCP_PORT` | `18791` | Listening port on collins |
-| `MCP_BIND` | `10.70.80.12` | Bind to wg-teleport mesh IP only |
-| `BB_URL` | `http://127.0.0.1:1234` | BlueBubbles server |
-| `BB_PASSWORD_FILE` | `/Users/collins/.config/bluebubbles/password` | Auth |
 
 ## Tools (20)
 
 ### Server
-| Tool | Description |
-|------|-------------|
-| `bb_server_info` | Server health, version, `private_api` status, `helper_connected` |
-
-### Chats
-| Tool | Inputs | Description |
-|------|--------|-------------|
-| `bb_list_chats` | `limit`, `offset`, `sort` | List conversations with last message |
-| `bb_get_chat` | `guid` | Single chat details |
-| `bb_create_chat` | `addresses[]`, `message?`, `isGroup?`, `groupName?` | Start new conversation |
-| `bb_delete_chat` | `guid` | Delete/archive chat locally |
-
-### Messages
-| Tool | Inputs | Description |
-|------|--------|-------------|
-| `bb_get_chat_messages` | `chat_guid`, `limit`, `sort`, `after?` | Chat message history |
-| `bb_send_message` | `chat_guid`, `message`, `method?` | Send text (apple-script or private-api) |
-| `bb_send_attachment` | `chat_guid`, `attachment` (base64), `filename`, `mimeType` | Send file/image |
-| `bb_get_attachment` | `guid`, `download?` | Attachment metadata + optional base64 |
-| `bb_react_message` | `chatGuid`, `messageGuid`, `reaction` | Tapback (private-api) |
-| `bb_unsend_message` | `guid` | Unsend message (private-api) |
-| `bb_edit_message` | `guid`, `editedMessage` | Edit message text (private-api) |
-| `bb_set_typing` | `guid`, `typing` | Typing indicator (private-api) |
-| `bb_mark_read` | `guid` | Mark chat as read |
+- **`bb_server_info`** — Health, version, `private_api`, `helper_connected`, iCloud account
 
 ### Contacts
-| Tool | Inputs | Description |
-|------|--------|-------------|
-| `bb_list_contacts` | `search?`, `limit?` | Address book — search normalized (E.164 matches any format) |
-| `bb_contact_query` | `addresses[]` | **Canonical lookup** — phone/email → full contact (BB normalizes) |
+- **`bb_contact_query`** `addresses: string[]` — Phone/email -> Apple Contacts record (name, emails, birthday). Canonical lookup.
+- **`bb_list_contacts`** `search?: string` — Digit-normalized search across all contacts
 
 ### Handles
-| Tool | Inputs | Description |
-|------|--------|-------------|
-| `bb_list_handles` | `limit`, `offset` | All iMessage handles seen on this Mac |
-| `bb_handle_query` | `addresses[]` | Addresses → handle objects + chat GUIDs |
+- **`bb_list_handles`** `limit, offset` — All iMessage/SMS handles
+- **`bb_handle_query`** `addresses: string[]` — Filter handles by address (client-side; BB v1.9.9 ignores server filter)
+
+### Chats
+- **`bb_list_chats`** `limit, offset, sort` — All conversations
+- **`bb_get_chat`** `guid` — Single chat with participants
+- **`bb_create_chat`** `addresses[], message?, method?` — New conversation (private-api required)
+- **`bb_delete_chat`** `guid` — Delete/archive
+- **`bb_mark_read`** `guid` — Clear unread
+
+### Messages
+- **`bb_get_chat_messages`** `chat_guid, limit, sort, after?` — Message history
+- **`bb_send_message`** `chat_guid, message, method?` — Send text. Bare +E164 auto-normalizes to `iMessage;-;+...`. Default method: `private-api`
+- **`bb_send_attachment`** `chat_guid, attachment (base64), filename, mimeType` — Send file
+- **`bb_get_attachment`** `guid, maxBytes?` — Download. <=200KB: inline base64. >200KB: `downloadUrl`
+- **`bb_react_message`** `chatGuid, messageGuid, reaction` — Tapback. Named string required: `"love"`, `"like"`, `"dislike"`, `"laugh"`, `"emphasize"`, `"question"`, prefix `-` to remove. Integer aliases 2000-2005 mapped internally.
+- **`bb_unsend_message`** `guid` — Unsend (private-api)
+- **`bb_edit_message`** `guid, editedMessage, backwardsCompatibilityMessage?` — Edit message (private-api)
+- **`bb_set_typing`** `guid, typing: boolean` — Typing indicator (private-api)
 
 ### Find My
-| Tool | Description |
-|------|-------------|
-| `bb_find_my_devices` | iCloud devices with location + battery |
-| `bb_find_my_friends` | Find My friends and their locations |
+- **`bb_find_my_devices`** — All iCloud devices with name, class, battery, location
+- **`bb_find_my_friends`** — Find My friends with locations
 
-## Contact Lookup Guide
+## GUID Format
 
-### Number → Name (THE right way)
-```bash
-mcporter call bluebubbles.bb_contact_query \
-  --args '{"addresses":["+12673479614"]}'
-# Works with: "+12673479614", "(267) 347-9614", "2673479614" — BB normalizes
+```
+iMessage;-;+12673479614        direct iMessage (phone)
+iMessage;-;user@icloud.com     direct iMessage (email)
+SMS;-;+12673479614             SMS
+iMessage;+;chat<id>            group iMessage
 ```
 
-### Name → Chat GUID
-```bash
-# Step 1: get phone
-mcporter call bluebubbles.bb_list_contacts --args '{"search":"Mom"}'
-
-# Step 2: get chat GUID
-mcporter call bluebubbles.bb_handle_query --args '{"addresses":["+14847070468"]}'
-# Returns handle.chats[].guid
-```
-
-## Tapback Reaction IDs
-
-| ID | Reaction | Remove |
-|----|---------|--------|
-| 2000 | ❤️ Love | -2000 |
-| 2001 | 👍 Like | -2001 |
-| 2002 | 👎 Dislike | -2002 |
-| 2003 | 😂 Laugh | -2003 |
-| 2004 | ‼️ Emphasis | -2004 |
-| 2005 | ❓ Question | -2005 |
-
-**Note:** Reactions require `private_api: true` and `helper_connected: true` in `bb_server_info`. Returns `{"ok":false,"reason":"private_api_unavailable"}` if helper is disconnected — handle gracefully.
+`bb_send_message` accepts bare `+E164` and auto-prefixes `iMessage;-;`.
 
 ## Private API Features
 
-The following tools require the BlueBubbles helper app to be connected:
-- `bb_react_message`, `bb_unsend_message`, `bb_edit_message`, `bb_set_typing`
-
-All four return structured failure instead of throwing when unavailable:
+`bb_react_message`, `bb_unsend_message`, `bb_edit_message`, `bb_set_typing`, `bb_create_chat` require:
 ```json
-{
-  "ok": false,
-  "reason": "private_api_unavailable",
-  "feature": "bb_react_message",
-  "hint": "BlueBubbles helper app must be connected..."
-}
+{ "private_api": true, "helper_connected": true }
 ```
+from `bb_server_info`. When unavailable, tools return `{ "ok": false, "reason": "private_api_unavailable" }`.
 
-## Troubleshooting
+## Known Limitations (BB v1.9.9)
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `mcporter call` hangs | SSH tunnel down | `systemctl --user restart openclaw-bb-mcp-forward` (stop + start if oc-guard blocks) |
-| Port 18800 in use | Old SSH process lingering | `fuser -k 18800/tcp` then restart service |
-| `Non-200 status code (404)` | Wrong baseUrl (missing `/sse`) | Ensure `baseUrl` ends with `/sse` |
-| `private_api_unavailable` | BB helper not connected | Open BlueBubbles on collins, reconnect helper |
-| Handle endpoints 404 | BB v1.9.9 quirk | Expected — `bb_list_handles` uses POST /handle/query internally |
+| Issue | Workaround |
+|---|---|
+| POST /handle/query ignores addresses filter | MCP fetches all handles, filters client-side |
+| Large attachment downloads | Files >200KB return downloadUrl instead of inline base64 |
+| POST /api/v1/chat returns 404 | Correct endpoint is /api/v1/chat/new |
+| Reactions require named strings | Integer codes mapped via REACTION_MAP |
 
 ## Development
 
 ```bash
-# On collins
-cd ~/code/bluebubbles-mcp
+npm run build          # compile TypeScript
 
-# Build
-npm run build
-
-# Run in stdio mode (dev/test)
-BB_URL=http://127.0.0.1:1234 BB_PASSWORD_FILE=~/.config/bluebubbles/password \
-  node dist/index.js
-
-# Run in HTTP mode (production)
-MCP_TRANSPORT=http MCP_PORT=18791 MCP_BIND=10.70.80.12 \
-  BB_URL=http://127.0.0.1:1234 BB_PASSWORD_FILE=~/.config/bluebubbles/password \
-  node dist/index.js
-
-# Reload service after build
-launchctl stop com.openclaw.bluebubbles-mcp && launchctl start com.openclaw.bluebubbles-mcp
+# Reload service after rebuild
+launchctl stop com.openclaw.bluebubbles-mcp
+launchctl start com.openclaw.bluebubbles-mcp
+curl http://10.70.80.12:18791/health
 ```
+
+## Changelog
+
+### v2.0.0 (2026-03-17/18)
+- HTTP/SSE persistent transport (was stdio per-call)
+- Per-connection Server instances (fixes "Already connected" crash on reconnect)
+- 7 -> 20 tools
+- bb_contact_query: Apple Contacts lookup (fixes unknown contact name resolution)
+- bb_handle_query: client-side address filter (BB v1.9.9 server filter broken)
+- bb_send_message: auto-normalize bare +E164 to iMessage;-;+..., default private-api
+- bb_send_attachment: multipart FormData upload with required name field
+- bb_get_attachment: binary download with size-based inline/URL strategy
+- bb_react_message: REACTION_MAP (integer aliases -> named strings)
+- bb_edit_message: backwardsCompatibilityMessage + partIndex added to payload
+- bb_create_chat: correct endpoint /api/v1/chat/new
+- bb_find_my_devices: summarized response (was 86KB raw)
+
+### v1.0.0 (2026-03-16)
+- Initial: 7 tools, stdio transport
