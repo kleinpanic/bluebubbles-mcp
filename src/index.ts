@@ -410,7 +410,7 @@ async function handleCreateChat(args: Record<string, unknown>): Promise<string> 
   if (args.message)   body.message   = args.message;
   if (args.isGroup)   body.isGroup   = args.isGroup;
   if (args.groupName) body.groupName = args.groupName;
-  const data = await bbPost<Record<string, unknown>>("/api/v1/chat", body);
+  const data = await bbPost<Record<string, unknown>>("/api/v1/chat/new", body);
   return JSON.stringify(data, null, 2);
 }
 
@@ -484,6 +484,7 @@ async function handleSendAttachment(args: Record<string, unknown>): Promise<stri
   try {
     const formData = new FormData();
     formData.append("chatGuid", chatGuid);
+    formData.append("name", filename);
     formData.append("tempGuid", `temp-${Date.now()}`);
     const fileBuffer = readFileSync(tmpFile);
     const blob = new Blob([fileBuffer], { type: mimeType });
@@ -500,31 +501,66 @@ async function handleSendAttachment(args: Record<string, unknown>): Promise<stri
 }
 
 async function handleGetAttachment(args: Record<string, unknown>): Promise<string> {
-  const guid     = String(args.guid);
-  const download = Boolean(args.download ?? false);
-  const data     = await bbGet<Record<string, unknown>>(`/api/v1/attachment/${encodeURIComponent(guid)}`);
+  const guid      = String(args.guid);
+  const maxBytes  = Number(args.maxBytes ?? 200 * 1024);  // default 200KB limit for base64 inline
 
-  if (download) {
-    // Fetch the actual file data
-    const dlData = await bbGet<Record<string, unknown>>(`/api/v1/attachment/${encodeURIComponent(guid)}/download`);
-    return JSON.stringify({ ...data, fileData: dlData }, null, 2);
+  // Get metadata
+  const meta    = await bbGet<Record<string, unknown>>(`/api/v1/attachment/${encodeURIComponent(guid)}`);
+  const attMeta = (meta.data ?? meta) as Record<string, unknown>;
+  const totalBytes = Number(attMeta.totalBytes ?? 0);
+  const mime       = String(attMeta.mimeType ?? "application/octet-stream");
+
+  // Provide direct download URL (no auth in path — BB password in query param)
+  const dlUrl = `${BB_URL}/api/v1/attachment/${encodeURIComponent(guid)}/download?password=${encodeURIComponent(BB_PASSWORD)}`;
+
+  // If file is small enough, inline base64; otherwise just return the URL
+  if (totalBytes > 0 && totalBytes <= maxBytes) {
+    const res = await fetch(dlUrl);
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      return JSON.stringify({
+        guid, transferName: attMeta.transferName, mimeType: mime,
+        totalBytes: buf.length,
+        data: buf.toString("base64"),
+      }, null, 2);
+    }
   }
-  return JSON.stringify(data, null, 2);
+
+  // Large files or failed download — return metadata + URL for manual fetch
+  return JSON.stringify({
+    guid,
+    transferName: attMeta.transferName,
+    mimeType:     mime,
+    totalBytes,
+    downloadUrl:  dlUrl,
+    note:         totalBytes > maxBytes
+      ? `File too large (${totalBytes} bytes > ${maxBytes} limit) for inline base64. Fetch downloadUrl directly.`
+      : "Download URL provided for direct fetch.",
+  }, null, 2);
 }
 
+// Reaction name map — BB v1.9.9 requires named strings, not integers
+const REACTION_MAP: Record<string, string> = {
+  "love": "love", "like": "like", "dislike": "dislike",
+  "laugh": "laugh", "emphasize": "emphasize", "question": "question",
+  "-love": "-love", "-like": "-like", "-dislike": "-dislike",
+  "-laugh": "-laugh", "-emphasize": "-emphasize", "-question": "-question",
+  // Integer aliases (iMessage associatedMessageType)
+  "2000": "love",  "2001": "like",  "2002": "dislike",
+  "2003": "laugh", "2004": "emphasize", "2005": "question",
+  "3000": "-love", "3001": "-like",  "3002": "-dislike",
+  "3003": "-laugh","3004": "-emphasize","3005": "-question",
+};
 async function handleReactMessage(args: Record<string, unknown>): Promise<string> {
-  try {
-    const data = await bbPost<Record<string, unknown>>("/api/v1/message/react", {
-      chatGuid:    String(args.chatGuid),
-      selectedMessageGuid: String(args.messageGuid),
-      reaction:    String(args.reaction),   // BB API requires string e.g. "2000"
-      method:      "private-api",
-    });
-    return JSON.stringify(data, null, 2);
-  } catch (err) {
-    if (isPrivateApiError(err as Error)) return privateApiError("bb_react_message");
-    throw err;
-  }
+  // private-api required — check bb_server_info private_api field before calling
+  const rawReaction = String(args.reaction ?? "like");
+  const reaction    = REACTION_MAP[rawReaction] ?? rawReaction;
+  const data = await bbPost<Record<string, unknown>>("/api/v1/message/react", {
+    chatGuid:            String(args.chatGuid),
+    selectedMessageGuid: String(args.messageGuid),
+    reaction,  // named string: "love","like","dislike","laugh","emphasize","question" (prefix - to remove)
+  });
+  return JSON.stringify(data, null, 2);
 }
 
 async function handleUnsendMessage(args: Record<string, unknown>): Promise<string> {
@@ -543,6 +579,8 @@ async function handleEditMessage(args: Record<string, unknown>): Promise<string>
     const guid = String(args.guid);
     const data = await bbPost<Record<string, unknown>>(`/api/v1/message/${encodeURIComponent(guid)}/edit`, {
       editedMessage: String(args.editedMessage),
+      backwardsCompatibilityMessage: String(args.backwardsCompatibilityMessage ?? args.editedMessage),
+      partIndex: Number(args.partIndex ?? 0),
     });
     return JSON.stringify(data, null, 2);
   } catch (err) {
