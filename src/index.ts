@@ -449,9 +449,16 @@ async function handleGetChatMessages(args: Record<string, unknown>): Promise<str
 }
 
 async function handleSendMessage(args: Record<string, unknown>): Promise<string> {
-  const chatGuid = String(args.chatGuid ?? args.chat_guid);
-  const message  = String(args.message);
-  const method   = String(args.method ?? "apple-script");
+  let chatGuid = String(args.chatGuid ?? args.chat_guid);
+  const message = String(args.message);
+  const method  = String(args.method ?? "private-api");
+  // Normalize bare phone numbers to iMessage GUID format
+  if (/^\+?\d{7,15}$/.test(chatGuid)) {
+    const digits = chatGuid.replace(/\D/g, "");
+    chatGuid = `iMessage;-;+${digits}`;
+  } else if (/^\d{10}$/.test(chatGuid)) {
+    chatGuid = `iMessage;-;+1${chatGuid}`;
+  }
   const data = await bbPost<Record<string, unknown>>("/api/v1/message/text", {
     chatGuid, message, method, subject: "", tempGuid: `temp-${Date.now()}`,
   });
@@ -510,7 +517,7 @@ async function handleReactMessage(args: Record<string, unknown>): Promise<string
     const data = await bbPost<Record<string, unknown>>("/api/v1/message/react", {
       chatGuid:    String(args.chatGuid),
       selectedMessageGuid: String(args.messageGuid),
-      reaction:    Number(args.reaction),
+      reaction:    String(args.reaction),   // BB API requires string e.g. "2000"
       method:      "private-api",
     });
     return JSON.stringify(data, null, 2);
@@ -619,19 +626,42 @@ async function handleListHandles(args: Record<string, unknown>): Promise<string>
 }
 
 async function handleHandleQuery(args: Record<string, unknown>): Promise<string> {
-  const addresses = args.addresses as string[];
-  const data = await bbPost<Record<string, unknown>>("/api/v1/handle/query", {
-    addresses,
-    limit: 50,
-    offset: 0,
-    withChats: true,
+  const addresses = (args.addresses as string[]).map(a => a.replace(/\D/g, ""));
+  // BB v1.9.9 /api/v1/handle/query ignores the addresses filter — fetch all, filter client-side
+  const PAGE = 200;
+  let offset = 0, allHandles: Record<string, unknown>[] = [], total = Infinity;
+  while (allHandles.length < total) {
+    const page = await bbPost<Record<string, unknown>>("/api/v1/handle/query", { addresses: [], limit: PAGE, offset, withChats: false });
+    const items = (page.data as Record<string, unknown>[]) ?? [];
+    const meta  = page.metadata as Record<string, unknown> | undefined;
+    if (total === Infinity) total = Number(meta?.total ?? items.length);
+    if (!items.length) break;
+    allHandles = allHandles.concat(items);
+    offset += PAGE;
+    if (allHandles.length >= total) break;
+  }
+  // Filter by normalized digits match
+  const matched = allHandles.filter(h => {
+    const hd = String((h as Record<string, unknown>).address ?? "").replace(/\D/g, "");
+    return addresses.some(a => hd.endsWith(a) || a.endsWith(hd));
   });
-  return JSON.stringify(data, null, 2);
+  return JSON.stringify({ status: 200, message: "Success", data: matched, metadata: { total: matched.length } }, null, 2);
 }
 
 async function handleFindMyDevices(): Promise<string> {
   const data = await bbGet<Record<string, unknown>>("/api/v1/icloud/findmy/devices");
-  return JSON.stringify(data, null, 2);
+  interface Device { name?: string; batteryLevel?: number; batteryStatus?: string; deviceClass?: string;
+    location?: { latitude?: number; longitude?: number; horizontalAccuracy?: number; timestamp?: number }; }
+  const devices = (data.data as Device[]) ?? [];
+  const summary = devices.map(d => ({
+    name: d.name, class: d.deviceClass,
+    battery: d.batteryLevel !== undefined ? String(Math.round((d.batteryLevel ?? 0) * 100)) + '% (' + (d.batteryStatus ?? '?') + ')' : 'unknown',
+    location: d.location ? {
+      lat: d.location.latitude?.toFixed(4), lon: d.location.longitude?.toFixed(4),
+      accuracy: d.location.horizontalAccuracy, ts: d.location.timestamp,
+    } : null,
+  }));
+  return JSON.stringify({ status: 200, count: summary.length, devices: summary }, null, 2);
 }
 
 async function handleFindMyFriends(): Promise<string> {
@@ -687,11 +717,11 @@ function createServer(): Server {
 
 // ─── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  const server = createServer();
-
   if (MCP_TRANSPORT === "http") {
     // HTTP/SSE mode — persistent service bound to wg-teleport mesh IP
-    const sessions = new Map<string, SSEServerTransport>();
+    // NOTE: A new Server instance must be created per SSE connection.
+    // The MCP SDK Server is NOT reusable across connections.
+    const sessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
 
     const httpServer = http.createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
@@ -699,15 +729,22 @@ async function main() {
       // Health check
       if (req.method === "GET" && url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, version: MCP_VERSION, transport: "http/sse", tools: TOOLS.length }));
+        res.end(JSON.stringify({ ok: true, version: MCP_VERSION, transport: "http/sse", tools: TOOLS.length, activeSessions: sessions.size }));
         return;
       }
 
-      // SSE connection endpoint — client connects here to establish session
+      // SSE connection endpoint — each connection gets its own Server instance
       if (req.method === "GET" && url.pathname === "/sse") {
         const transport = new SSEServerTransport("/message", res);
-        sessions.set(transport.sessionId, transport);
-        transport.onclose = () => sessions.delete(transport.sessionId);
+        const server = createServer();  // fresh instance per connection
+        sessions.set(transport.sessionId, { transport, server });
+        transport.onclose = () => {
+          sessions.delete(transport.sessionId);
+          process.stderr.write(`Session ${transport.sessionId.slice(0,8)} closed (${sessions.size} active)
+`);
+        };
+        process.stderr.write(`New session ${transport.sessionId.slice(0,8)} (${sessions.size + 1} active)
+`);
         await server.connect(transport);
         return;
       }
@@ -715,13 +752,13 @@ async function main() {
       // Message endpoint — client POSTs MCP messages here
       if (req.method === "POST" && url.pathname === "/message") {
         const sessionId = url.searchParams.get("sessionId");
-        const transport = sessionId ? sessions.get(sessionId) : undefined;
-        if (!transport) {
+        const session = sessionId ? sessions.get(sessionId) : undefined;
+        if (!session) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Session not found or expired. Reconnect to /sse." }));
           return;
         }
-        await transport.handlePostMessage(req, res);
+        await session.transport.handlePostMessage(req, res);
         return;
       }
 
@@ -737,6 +774,7 @@ async function main() {
     });
   } else {
     // stdio mode (default — backward compat)
+    const server = createServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
     process.stderr.write(`BlueBubbles MCP v${MCP_VERSION} — stdio mode\n`);
