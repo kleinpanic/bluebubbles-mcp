@@ -15,22 +15,30 @@ Agent (broklein)
 
 ## Setup
 
+Requires Node.js 20+.
+
 ### Collins (macOS)
 ```bash
 cd ~/code/bluebubbles-mcp
-npm install && npm run build
-
-# Install launchd service
-cp LaunchAgents/com.openclaw.bluebubbles-mcp.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.openclaw.bluebubbles-mcp.plist
+npm ci && npm run build
+MCP_TRANSPORT=http BB_PASSWORD_FILE=~/.config/bluebubbles/password npm start
 ```
 
-Config via environment in plist:
+To run it as a launchd service, create a plist in `~/Library/LaunchAgents/`
+(e.g. `com.openclaw.bluebubbles-mcp.plist`, not included in this repo) that runs
+`node /path/to/bluebubbles-mcp/dist/index.js` with the environment below, then
+`launchctl load` it.
+
+Config via environment:
 - `BB_URL` — BlueBubbles server URL (default: `http://127.0.0.1:1234`)
-- `BB_PASSWORD` — path to password file or raw password
-- `MCP_BIND` — bind address (default: `10.70.80.12`)
-- `MCP_PORT` — port (default: `18791`)
-- `MCP_TRANSPORT` — `http` or `stdio` (default: `http`)
+- `BB_PASSWORD` — raw BlueBubbles server password
+- `BB_PASSWORD_FILE` — path to a file containing the password (used when `BB_PASSWORD` is unset)
+- `MCP_TRANSPORT` — `stdio` or `http` (default: `stdio`; set `http` for the persistent SSE service)
+- `MCP_BIND` — HTTP bind address (default: `10.70.80.12`)
+- `MCP_PORT` — HTTP port (default: `18791`)
+- `MCP_AUTH_TOKEN` — optional shared secret for HTTP mode. When set, `/sse` and `/message`
+  require `Authorization: Bearer <token>` (`/health` stays open). Strongly recommended: without
+  it, anything that can reach `MCP_BIND:MCP_PORT` can send messages as you.
 
 ### Broklein (Linux)
 ```bash
@@ -42,7 +50,8 @@ systemctl --user start openclaw-bb-mcp-forward
   "servers": {
     "bluebubbles": {
       "type": "sse",
-      "baseUrl": "http://127.0.0.1:18800/sse"
+      "baseUrl": "http://127.0.0.1:18800/sse",
+      "headers": { "Authorization": "Bearer <MCP_AUTH_TOKEN>" }
     }
   }
 }
@@ -64,7 +73,7 @@ systemctl --user start openclaw-bb-mcp-forward
 ### Chats
 - **`bb_list_chats`** `limit, offset, sort` — All conversations
 - **`bb_get_chat`** `guid` — Single chat with participants
-- **`bb_create_chat`** `addresses[], message?, method?` — New conversation (private-api required)
+- **`bb_create_chat`** `addresses[], message?, isGroup?, groupName?` — New conversation (private-api required)
 - **`bb_delete_chat`** `guid` — Delete/archive
 - **`bb_mark_read`** `guid` — Clear unread
 
@@ -72,7 +81,7 @@ systemctl --user start openclaw-bb-mcp-forward
 - **`bb_get_chat_messages`** `chat_guid, limit, sort, after?` — Message history
 - **`bb_send_message`** `chat_guid, message, method?` — Send text. Bare +E164 auto-normalizes to `iMessage;-;+...`. Default method: `private-api`
 - **`bb_send_attachment`** `chat_guid, attachment (base64), filename, mimeType` — Send file
-- **`bb_get_attachment`** `guid, maxBytes?` — Download. <=200KB: inline base64. >200KB: `downloadUrl`
+- **`bb_get_attachment`** `guid, maxBytes?` — Download. <=200KB: inline base64. >200KB: `downloadUrl` (without the password; append `?password=...` yourself)
 - **`bb_react_message`** `chatGuid, messageGuid, reaction` — Tapback. Named string required: `"love"`, `"like"`, `"dislike"`, `"laugh"`, `"emphasize"`, `"question"`, prefix `-` to remove. Integer aliases 2000-2005 mapped internally.
 - **`bb_unsend_message`** `guid` — Unsend (private-api)
 - **`bb_edit_message`** `guid, editedMessage, backwardsCompatibilityMessage?` — Edit message (private-api)
@@ -91,7 +100,7 @@ SMS;-;+12673479614             SMS
 iMessage;+;chat<id>            group iMessage
 ```
 
-`bb_send_message` accepts bare `+E164` and auto-prefixes `iMessage;-;`.
+`bb_send_message` accepts bare `+E164` and auto-prefixes `iMessage;-;`. A bare 10-digit number is treated as US (`+1`).
 
 ## Private API Features
 
@@ -106,14 +115,17 @@ from `bb_server_info`. When unavailable, tools return `{ "ok": false, "reason": 
 | Issue | Workaround |
 |---|---|
 | POST /handle/query ignores addresses filter | MCP fetches all handles, filters client-side |
-| Large attachment downloads | Files >200KB return downloadUrl instead of inline base64 |
+| Large attachment downloads | Files >200KB return downloadUrl (no password) instead of inline base64 |
 | POST /api/v1/chat returns 404 | Correct endpoint is /api/v1/chat/new |
 | Reactions require named strings | Integer codes mapped via REACTION_MAP |
 
 ## Development
 
 ```bash
-npm run build          # compile TypeScript
+npm ci                 # install exact locked dependencies
+npm run build          # compile TypeScript to dist/
+npm run typecheck      # type-check without emitting
+npm test               # build, then run regression tests (node:test)
 
 # Reload service after rebuild
 launchctl stop com.openclaw.bluebubbles-mcp

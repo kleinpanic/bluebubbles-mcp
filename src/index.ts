@@ -2,7 +2,7 @@
 /**
  * BlueBubbles MCP Server v2.0
  *
- * Tools (21 total):
+ * Tools (20 total):
  *   bb_server_info          — server health & version
  *   bb_list_chats           — list conversations
  *   bb_get_chat             — single chat detail by GUID
@@ -37,9 +37,8 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync, existsSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 import * as http from "http";
-import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
 
@@ -49,6 +48,8 @@ const MCP_TRANSPORT = process.env.MCP_TRANSPORT ?? "stdio";
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? "18791", 10);
 const MCP_BIND = process.env.MCP_BIND ?? "10.70.80.12";
 const MCP_VERSION = "2.0.0";
+// Optional shared secret for HTTP mode; when set, /sse and /message require "Authorization: Bearer <token>"
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN ?? "";
 
 let BB_PASSWORD = process.env.BB_PASSWORD ?? "";
 if (!BB_PASSWORD && process.env.BB_PASSWORD_FILE) {
@@ -190,14 +191,14 @@ const TOOLS: Tool[] = [
       properties: {
         chat_guid: { type: "string", description: "Chat GUID or phone number/email address" },
         message:   { type: "string", description: "Message text to send" },
-        method:    { type: "string", description: "'apple-script' (default, more compatible) or 'private-api' (faster)", enum: ["apple-script", "private-api"] },
+        method:    { type: "string", description: "'private-api' (default, faster) or 'apple-script' (more compatible)", enum: ["apple-script", "private-api"] },
       },
       required: ["chat_guid", "message"],
     },
   },
   {
     name: "bb_send_attachment",
-    description: "Send a file or image to a chat. Accepts base64-encoded data. The MCP decodes it to a temp file on collins before uploading.",
+    description: "Send a file or image to a chat. Accepts base64-encoded data, which is uploaded to BlueBubbles as multipart form data.",
     inputSchema: {
       type: "object",
       properties: {
@@ -211,25 +212,25 @@ const TOOLS: Tool[] = [
   },
   {
     name: "bb_get_attachment",
-    description: "Get attachment metadata by GUID. Set download=true to include base64 file data.",
+    description: "Get an attachment by GUID. Files up to maxBytes are returned inline as base64; larger files return metadata and the download path.",
     inputSchema: {
       type: "object",
       properties: {
         guid:     { type: "string", description: "Attachment GUID" },
-        download: { type: "boolean", description: "If true, fetch and return base64-encoded file data (default false)" },
+        maxBytes: { type: "number", description: "Max size to return inline as base64 (default 204800)" },
       },
       required: ["guid"],
     },
   },
   {
     name: "bb_react_message",
-    description: "Send a tapback reaction to a message. Requires private-api / helper connected. Reaction IDs: 2000=❤️love, 2001=👍like, 2002=👎dislike, 2003=😂laugh, 2004=‼️emphasis, 2005=?question. Prefix with - to remove (e.g. -2000).",
+    description: "Send a tapback reaction to a message. Requires private-api / helper connected. Reactions: love, like, dislike, laugh, emphasize, question; prefix with - to remove (e.g. -love). Integer aliases 2000-2005 (add) and 3000-3005 (remove) are also accepted.",
     inputSchema: {
       type: "object",
       properties: {
         chatGuid:    { type: "string", description: "The chat GUID" },
         messageGuid: { type: "string", description: "The message GUID to react to" },
-        reaction:    { type: "number", description: "Reaction ID (2000-2005, or negative to remove)" },
+        reaction:    { type: ["string", "number"], description: "Reaction name (e.g. 'love', '-love') or integer alias (2000-2005, 3000-3005)" },
       },
       required: ["chatGuid", "messageGuid", "reaction"],
     },
@@ -253,6 +254,8 @@ const TOOLS: Tool[] = [
       properties: {
         guid:          { type: "string", description: "The message GUID to edit" },
         editedMessage: { type: "string", description: "The new text content" },
+        backwardsCompatibilityMessage: { type: "string", description: "Fallback text for clients that can't show edits (default: editedMessage)" },
+        partIndex:     { type: "number", description: "Message part to edit (default 0)" },
       },
       required: ["guid", "editedMessage"],
     },
@@ -448,59 +451,47 @@ async function handleGetChatMessages(args: Record<string, unknown>): Promise<str
   }, null, 2);
 }
 
-async function handleSendMessage(args: Record<string, unknown>): Promise<string> {
+/** Bare phone numbers → iMessage GUID. 10 bare digits are treated as US numbers (+1). */
+export function normalizeChatGuid(chatGuid: string): string {
+  if (/^\d{10}$/.test(chatGuid)) return `iMessage;-;+1${chatGuid}`;
+  if (/^\+?\d{7,15}$/.test(chatGuid)) return `iMessage;-;+${chatGuid.replace(/\D/g, "")}`;
+  return chatGuid;
+}
+
+export async function handleSendMessage(args: Record<string, unknown>): Promise<string> {
   let chatGuid = String(args.chatGuid ?? args.chat_guid);
   const message = String(args.message);
   const method  = String(args.method ?? "private-api");
   // Normalize bare phone numbers to iMessage GUID format
-  if (/^\+?\d{7,15}$/.test(chatGuid)) {
-    const digits = chatGuid.replace(/\D/g, "");
-    chatGuid = `iMessage;-;+${digits}`;
-  } else if (/^\d{10}$/.test(chatGuid)) {
-    chatGuid = `iMessage;-;+1${chatGuid}`;
-  }
+  chatGuid = normalizeChatGuid(chatGuid);
   const data = await bbPost<Record<string, unknown>>("/api/v1/message/text", {
     chatGuid, message, method, subject: "", tempGuid: `temp-${Date.now()}`,
   });
   return JSON.stringify(data, null, 2);
 }
 
-async function handleSendAttachment(args: Record<string, unknown>): Promise<string> {
+export async function handleSendAttachment(args: Record<string, unknown>): Promise<string> {
   const chatGuid   = String(args.chat_guid ?? args.chatGuid);
   const b64        = String(args.attachment);
-  const filename   = String(args.filename);
+  // Caller-supplied name is only a display name; strip any directory components
+  const base       = path.basename(String(args.filename).replace(/\\/g, "/"));
+  const filename   = base === "." || base === ".." || !base ? "attachment" : base;
   const mimeType   = String(args.mimeType);
 
-  // Decode base64 to temp file
-  const tmpDir  = os.tmpdir();
-  const tmpFile = path.join(tmpDir, `bb-attach-${crypto.randomBytes(6).toString("hex")}-${filename}`);
-  try {
-    writeFileSync(tmpFile, Buffer.from(b64, "base64"));
-  } catch (err) {
-    throw new Error(`Failed to decode attachment: ${(err as Error).message}`);
-  }
+  // Multipart upload straight from memory (no temp file on disk)
+  const formData = new FormData();
+  formData.append("chatGuid", chatGuid);
+  formData.append("name", filename);
+  formData.append("tempGuid", `temp-${Date.now()}`);
+  const blob = new Blob([Buffer.from(b64, "base64")], { type: mimeType });
+  formData.append("attachment", blob, filename);
 
-  // Multipart upload using FormData + fetch
-  try {
-    const formData = new FormData();
-    formData.append("chatGuid", chatGuid);
-    formData.append("name", filename);
-    formData.append("tempGuid", `temp-${Date.now()}`);
-    const fileBuffer = readFileSync(tmpFile);
-    const blob = new Blob([fileBuffer], { type: mimeType });
-    formData.append("attachment", blob, filename);
-
-    const url = new URL(`${BB_URL}/api/v1/message/attachment`);
-    url.searchParams.set("password", BB_PASSWORD);
-    const res = await fetch(url.toString(), { method: "POST", body: formData });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-    return JSON.stringify(await res.json(), null, 2);
-  } finally {
-    try { unlinkSync(tmpFile); } catch {}
-  }
+  const res = await fetch(apiUrl("/api/v1/message/attachment"), { method: "POST", body: formData });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  return JSON.stringify(await res.json(), null, 2);
 }
 
-async function handleGetAttachment(args: Record<string, unknown>): Promise<string> {
+export async function handleGetAttachment(args: Record<string, unknown>): Promise<string> {
   const guid      = String(args.guid);
   const maxBytes  = Number(args.maxBytes ?? 200 * 1024);  // default 200KB limit for base64 inline
 
@@ -510,12 +501,13 @@ async function handleGetAttachment(args: Record<string, unknown>): Promise<strin
   const totalBytes = Number(attMeta.totalBytes ?? 0);
   const mime       = String(attMeta.mimeType ?? "application/octet-stream");
 
-  // Provide direct download URL (no auth in path — BB password in query param)
-  const dlUrl = `${BB_URL}/api/v1/attachment/${encodeURIComponent(guid)}/download?password=${encodeURIComponent(BB_PASSWORD)}`;
+  const dlPath = `/api/v1/attachment/${encodeURIComponent(guid)}/download`;
+  // Returned to the MCP client — must never carry the BlueBubbles password
+  const dlUrl  = `${BB_URL}${dlPath}`;
 
   // If file is small enough, inline base64; otherwise just return the URL
   if (totalBytes > 0 && totalBytes <= maxBytes) {
-    const res = await fetch(dlUrl);
+    const res = await fetch(apiUrl(dlPath));
     if (res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
       return JSON.stringify({
@@ -534,8 +526,8 @@ async function handleGetAttachment(args: Record<string, unknown>): Promise<strin
     totalBytes,
     downloadUrl:  dlUrl,
     note:         totalBytes > maxBytes
-      ? `File too large (${totalBytes} bytes > ${maxBytes} limit) for inline base64. Fetch downloadUrl directly.`
-      : "Download URL provided for direct fetch.",
+      ? `File too large (${totalBytes} bytes > ${maxBytes} limit) for inline base64. Fetch downloadUrl directly (append ?password=<BlueBubbles password>).`
+      : "Download URL provided for direct fetch (append ?password=<BlueBubbles password>).",
   }, null, 2);
 }
 
@@ -663,8 +655,19 @@ async function handleListHandles(args: Record<string, unknown>): Promise<string>
   return JSON.stringify(data, null, 2);
 }
 
-async function handleHandleQuery(args: Record<string, unknown>): Promise<string> {
-  const addresses = (args.addresses as string[]).map(a => a.replace(/\D/g, ""));
+/** Emails match case-insensitively; phone numbers match on digit suffix (country code variations). */
+export function handleAddressMatches(handleAddress: string, query: string): boolean {
+  if (query.includes("@") || handleAddress.includes("@")) {
+    return handleAddress.trim().toLowerCase() === query.trim().toLowerCase();
+  }
+  const hd = digitsOnly(handleAddress);
+  const qd = digitsOnly(query);
+  if (!hd || !qd) return false;
+  return hd.endsWith(qd) || qd.endsWith(hd);
+}
+
+export async function handleHandleQuery(args: Record<string, unknown>): Promise<string> {
+  const addresses = args.addresses as string[];
   // BB v1.9.9 /api/v1/handle/query ignores the addresses filter — fetch all, filter client-side
   const PAGE = 200;
   let offset = 0, allHandles: Record<string, unknown>[] = [], total = Infinity;
@@ -678,11 +681,7 @@ async function handleHandleQuery(args: Record<string, unknown>): Promise<string>
     offset += PAGE;
     if (allHandles.length >= total) break;
   }
-  // Filter by normalized digits match
-  const matched = allHandles.filter(h => {
-    const hd = String((h as Record<string, unknown>).address ?? "").replace(/\D/g, "");
-    return addresses.some(a => hd.endsWith(a) || a.endsWith(hd));
-  });
+  const matched = allHandles.filter(h => addresses.some(a => handleAddressMatches(String(h.address ?? ""), a)));
   return JSON.stringify({ status: 200, message: "Success", data: matched, metadata: { total: matched.length } }, null, 2);
 }
 
@@ -708,7 +707,7 @@ async function handleFindMyFriends(): Promise<string> {
 }
 
 // ─── Server setup ──────────────────────────────────────────────────────────────
-function createServer(): Server {
+export function createServer(): Server {
   const server = new Server(
     { name: "bluebubbles-mcp", version: MCP_VERSION },
     { capabilities: { tools: {} } }
@@ -753,62 +752,94 @@ function createServer(): Server {
   return server;
 }
 
+// ─── HTTP/SSE transport ────────────────────────────────────────────────────────
+/** Constant-time check of "Authorization: Bearer <token>". Always true when no token is configured. */
+export function isAuthorized(req: http.IncomingMessage, token: string = MCP_AUTH_TOKEN): boolean {
+  if (!token) return true;
+  const header = req.headers.authorization ?? "";
+  const expected = Buffer.from(`Bearer ${token}`);
+  const actual = Buffer.from(header);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+export function createHttpServer(authToken: string = MCP_AUTH_TOKEN): http.Server {
+  // NOTE: A new Server instance must be created per SSE connection.
+  // The MCP SDK Server is NOT reusable across connections.
+  const sessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
+
+  const route = async (req: http.IncomingMessage, res: http.ServerResponse) => {
+    // Fixed base: the Host header is client-controlled and may not parse as a URL
+    const url = new URL(req.url ?? "/", "http://localhost");
+
+    // Health check
+    if (req.method === "GET" && url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, version: MCP_VERSION, transport: "http/sse", tools: TOOLS.length, activeSessions: sessions.size }));
+      return;
+    }
+
+    if (!isAuthorized(req, authToken)) {
+      res.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": "Bearer" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+
+    // SSE connection endpoint — each connection gets its own Server instance
+    if (req.method === "GET" && url.pathname === "/sse") {
+      const transport = new SSEServerTransport("/message", res);
+      const server = createServer();  // fresh instance per connection
+      sessions.set(transport.sessionId, { transport, server });
+      transport.onclose = () => {
+        sessions.delete(transport.sessionId);
+        process.stderr.write(`Session ${transport.sessionId.slice(0,8)} closed (${sessions.size} active)
+`);
+      };
+      process.stderr.write(`New session ${transport.sessionId.slice(0,8)} (${sessions.size} active)
+`);
+      await server.connect(transport);
+      return;
+    }
+
+    // Message endpoint — client POSTs MCP messages here
+    if (req.method === "POST" && url.pathname === "/message") {
+      const sessionId = url.searchParams.get("sessionId");
+      const session = sessionId ? sessions.get(sessionId) : undefined;
+      if (!session) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Session not found or expired. Reconnect to /sse." }));
+        return;
+      }
+      await session.transport.handlePostMessage(req, res);
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found", endpoints: ["GET /health", "GET /sse", "POST /message"] }));
+  };
+
+  // A rejected promise from an async request listener would be unhandled and crash the process
+  return http.createServer((req, res) => {
+    route(req, res).catch((err) => {
+      process.stderr.write(`Request error: ${err}\n`);
+      if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal error" }));
+    });
+  });
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   if (MCP_TRANSPORT === "http") {
     // HTTP/SSE mode — persistent service bound to wg-teleport mesh IP
-    // NOTE: A new Server instance must be created per SSE connection.
-    // The MCP SDK Server is NOT reusable across connections.
-    const sessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
-
-    const httpServer = http.createServer(async (req, res) => {
-      const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-
-      // Health check
-      if (req.method === "GET" && url.pathname === "/health") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, version: MCP_VERSION, transport: "http/sse", tools: TOOLS.length, activeSessions: sessions.size }));
-        return;
-      }
-
-      // SSE connection endpoint — each connection gets its own Server instance
-      if (req.method === "GET" && url.pathname === "/sse") {
-        const transport = new SSEServerTransport("/message", res);
-        const server = createServer();  // fresh instance per connection
-        sessions.set(transport.sessionId, { transport, server });
-        transport.onclose = () => {
-          sessions.delete(transport.sessionId);
-          process.stderr.write(`Session ${transport.sessionId.slice(0,8)} closed (${sessions.size} active)
-`);
-        };
-        process.stderr.write(`New session ${transport.sessionId.slice(0,8)} (${sessions.size + 1} active)
-`);
-        await server.connect(transport);
-        return;
-      }
-
-      // Message endpoint — client POSTs MCP messages here
-      if (req.method === "POST" && url.pathname === "/message") {
-        const sessionId = url.searchParams.get("sessionId");
-        const session = sessionId ? sessions.get(sessionId) : undefined;
-        if (!session) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Session not found or expired. Reconnect to /sse." }));
-          return;
-        }
-        await session.transport.handlePostMessage(req, res);
-        return;
-      }
-
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found", endpoints: ["GET /health", "GET /sse", "POST /message"] }));
-    });
-
+    const httpServer = createHttpServer();
     httpServer.listen(MCP_PORT, MCP_BIND, () => {
       process.stderr.write(`BlueBubbles MCP v${MCP_VERSION} — HTTP/SSE on ${MCP_BIND}:${MCP_PORT}\n`);
       process.stderr.write(`Health: http://${MCP_BIND}:${MCP_PORT}/health\n`);
       process.stderr.write(`SSE:    http://${MCP_BIND}:${MCP_PORT}/sse\n`);
       process.stderr.write(`Tools:  ${TOOLS.length} registered\n`);
+      if (!MCP_AUTH_TOKEN) {
+        process.stderr.write(`WARNING: MCP_AUTH_TOKEN is not set — anyone who can reach ${MCP_BIND}:${MCP_PORT} can use these tools\n`);
+      }
     });
   } else {
     // stdio mode (default — backward compat)
@@ -819,7 +850,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal: ${err}\n`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    process.stderr.write(`Fatal: ${err}\n`);
+    process.exit(1);
+  });
+}
