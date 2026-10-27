@@ -50,6 +50,19 @@ test("send_attachment: filename cannot escape the temp dir or touch the filesyst
   fs.rmSync(dir, { recursive: true });
 });
 
+test("send_attachment: dot-only filenames are replaced, not passed on as '..' or '.'", async () => {
+  for (const filename of ["..", "a/..", "x\\..", "."]) {
+    const calls = stubFetch(() => ({ status: 200 }));
+    await bb.handleSendAttachment({
+      chat_guid: "iMessage;-;+15555550100",
+      attachment: Buffer.from("payload").toString("base64"),
+      filename,
+      mimeType: "text/plain",
+    });
+    assert.equal(calls[0].init.body.get("name"), "attachment", filename);
+  }
+});
+
 test("get_attachment: downloadUrl returned to the client does not contain the password", async () => {
   const calls = stubFetch(() => ({ data: { totalBytes: 10_000_000, mimeType: "image/png", transferName: "a.png" } }));
   const out = JSON.parse(await bb.handleGetAttachment({ guid: "att-1" }));

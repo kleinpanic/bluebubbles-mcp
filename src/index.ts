@@ -474,7 +474,8 @@ export async function handleSendAttachment(args: Record<string, unknown>): Promi
   const chatGuid   = String(args.chat_guid ?? args.chatGuid);
   const b64        = String(args.attachment);
   // Caller-supplied name is only a display name; strip any directory components
-  const filename   = path.basename(String(args.filename).replace(/\\/g, "/")) || "attachment";
+  const base       = path.basename(String(args.filename).replace(/\\/g, "/"));
+  const filename   = base === "." || base === ".." || !base ? "attachment" : base;
   const mimeType   = String(args.mimeType);
 
   // Multipart upload straight from memory (no temp file on disk)
